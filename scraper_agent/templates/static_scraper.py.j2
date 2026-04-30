@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""
+Auto-generated standalone web scraper.
+
+Target:        {{ target_url }}
+What:          {{ scrape_description }}
+Approach:      static HTML (requests + BeautifulSoup)
+Generated at:  {{ generated_at }}
+
+This script runs WITHOUT any agent. Just install deps and run:
+
+    pip install requests beautifulsoup4 lxml
+    python {{ "{{this_file}}" }} --output products.csv
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import logging
+import sys
+import time
+from typing import Any
+from urllib.parse import urljoin
+
+import requests
+from bs4 import BeautifulSoup
+
+
+# ─── Configuration baked in by the agent ──────────────────────────────────────
+START_URL = {{ target_url | tojson }}
+SELECTORS = json.loads(r"""
+{{ selectors_json }}
+""")
+STRATEGY = json.loads(r"""
+{{ strategy_json }}
+""")
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+RATE_LIMIT = float(STRATEGY.get("rate_limit_seconds", 1.0))
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    stream=sys.stderr,
+)
+log = logging.getLogger("scraper")
+
+
+def fetch(url: str, session: requests.Session, retries: int = 3) -> str:
+    """GET with exponential backoff."""
+    for attempt in range(retries):
+        try:
+            r = session.get(url, timeout=30)
+            r.raise_for_status()
+            return r.text
+        except Exception as e:
+            wait = 2 ** attempt
+            log.warning("Fetch failed (attempt %d/%d): %s — retrying in %ds",
+                        attempt + 1, retries, e, wait)
+            time.sleep(wait)
+    raise RuntimeError(f"Failed to fetch {url} after {retries} attempts")
+
+
+def extract_field(container, spec: dict[str, str]) -> Any:
+    """Pull one field out of a container element using a selector spec."""
+    sel = spec.get("selector")
+    method = spec.get("method", "text")
+    if not sel:
+        return None
+    el = container.select_one(sel)
+    if el is None:
+        return None
+    if method == "text":
+        return el.get_text(strip=True)
+    if method.startswith("attr:"):
+        attr = method.split(":", 1)[1]
+        val = el.get(attr, "")
+        # Resolve relative URLs for href/src
+        if attr in ("href", "src") and val:
+            val = urljoin(START_URL, val)
+        return val
+    return None
+
+
+def parse_page(html: str) -> tuple[list[dict], str | None]:
+    """Return (rows, next_page_url)."""
+    soup = BeautifulSoup(html, "lxml")
+    container_sel = SELECTORS.get("item_container")
+    if not container_sel:
+        log.error("No item_container selector configured")
+        return [], None
+
+    rows = []
+    for container in soup.select(container_sel):
+        row = {
+            field: extract_field(container, spec)
+            for field, spec in SELECTORS.get("fields", {}).items()
+        }
+        # Skip rows that are entirely empty
+        if any(v not in (None, "") for v in row.values()):
+            rows.append(row)
+
+    next_url = None
+    next_sel = SELECTORS.get("next_page_selector")
+    if next_sel:
+        nxt = soup.select_one(next_sel)
+        if nxt and nxt.get("href"):
+            next_url = urljoin(START_URL, nxt["href"])
+
+    return rows, next_url
+
+
+def scrape(start_url: str, max_pages: int) -> list[dict]:
+    session = requests.Session()
+    session.headers.update({"User-Agent": USER_AGENT})
+
+    all_rows: list[dict] = []
+    url = start_url
+    page = 0
+
+    while url and page < max_pages:
+        page += 1
+        log.info("Fetching page %d: %s", page, url)
+        html = fetch(url, session)
+        rows, next_url = parse_page(html)
+        log.info("Page %d → %d rows", page, len(rows))
+        all_rows.extend(rows)
+
+        if not next_url or next_url == url:
+            log.info("No further pages")
+            break
+        url = next_url
+        time.sleep(RATE_LIMIT)
+
+    return all_rows
+
+
+def write_output(rows: list[dict], path: str, fmt: str) -> None:
+    if not rows:
+        log.warning("No rows to write")
+        return
+    if fmt == "json":
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(rows, f, ensure_ascii=False, indent=2)
+    elif fmt == "jsonl":
+        with open(path, "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    else:  # csv
+        fieldnames = list(rows[0].keys())
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            w.writerows(rows)
+    log.info("Wrote %d rows to %s", len(rows), path)
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="Standalone scraper for {{ target_url }}")
+    p.add_argument("--url", default=START_URL, help="Start URL (default: %(default)s)")
+    p.add_argument("--output", default="output.{{ strategy.output_format or 'csv' }}",
+                   help="Output file path")
+    p.add_argument("--format", choices=["csv", "json", "jsonl"],
+                   default="{{ strategy.output_format or 'csv' }}")
+    p.add_argument("--max-pages", type=int, default=100,
+                   help="Max pagination pages (default: 100)")
+    args = p.parse_args()
+
+    try:
+        rows = scrape(args.url, args.max_pages)
+        write_output(rows, args.output, args.format)
+        return 0
+    except KeyboardInterrupt:
+        log.warning("Interrupted")
+        return 130
+    except Exception as e:
+        log.exception("Scrape failed: %s", e)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

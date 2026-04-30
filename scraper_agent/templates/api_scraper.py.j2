@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+"""
+Auto-generated standalone web scraper (API mode).
+
+Target:        {{ target_url }}
+What:          {{ scrape_description }}
+Approach:      direct JSON API calls — fastest and most reliable
+Generated at:  {{ generated_at }}
+
+Run standalone:
+
+    pip install requests
+    python {{ "{{this_file}}" }} --output products.json
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import logging
+import sys
+import time
+from typing import Any
+
+import requests
+
+
+START_URL = {{ target_url | tojson }}
+SELECTORS = json.loads(r"""
+{{ selectors_json }}
+""")
+STRATEGY = json.loads(r"""
+{{ strategy_json }}
+""")
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+RATE_LIMIT = float(STRATEGY.get("rate_limit_seconds", 1.0))
+
+# The first endpoint discovered by the agent is the primary scrape target
+API_ENDPOINTS = STRATEGY.get("target_endpoints_or_pages") or [START_URL]
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    stream=sys.stderr,
+)
+log = logging.getLogger("scraper")
+
+
+def fetch_json(url: str, session: requests.Session, retries: int = 3) -> Any:
+    for attempt in range(retries):
+        try:
+            r = session.get(url, timeout=30)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            wait = 2 ** attempt
+            log.warning("Fetch failed (attempt %d): %s — retrying in %ds",
+                        attempt + 1, e, wait)
+            time.sleep(wait)
+    raise RuntimeError(f"Failed to fetch {url}")
+
+
+def get_by_path(obj: Any, path: str) -> Any:
+    """Navigate a JSON object via a dotted path. Supports `[*]` for arrays."""
+    if not path:
+        return obj
+    parts = path.replace("[*]", ".*").split(".")
+    current = obj
+    for part in parts:
+        if part == "" or part == "*":
+            continue
+        if isinstance(current, dict):
+            current = current.get(part)
+        elif isinstance(current, list) and part.isdigit():
+            current = current[int(part)]
+        else:
+            return None
+        if current is None:
+            return None
+    return current
+
+
+def extract_rows(payload: Any) -> list[dict]:
+    items_path = SELECTORS.get("items_path", "")
+    items = get_by_path(payload, items_path) if items_path else payload
+    if items is None:
+        log.warning("items_path '%s' returned nothing", items_path)
+        return []
+    if not isinstance(items, list):
+        items = [items]
+
+    rows = []
+    for item in items:
+        row = {}
+        for field, spec in SELECTORS.get("fields", {}).items():
+            sel = spec.get("selector", "")  # for API mode, "selector" is a JSON path
+            if spec.get("method", "").startswith("json:"):
+                sel = spec["method"].split(":", 1)[1]
+            row[field] = get_by_path(item, sel)
+        if any(v not in (None, "") for v in row.values()):
+            rows.append(row)
+    return rows
+
+
+def get_next_page_url(payload: Any, current_url: str, page_num: int) -> str | None:
+    """Best-effort pagination for JSON APIs."""
+    pag_type = STRATEGY.get("pagination_strategy", "none")
+
+    # Common: payload contains a `next` URL
+    for key in ("next", "next_page", "nextUrl", "next_url"):
+        if isinstance(payload, dict) and payload.get(key):
+            return str(payload[key])
+
+    # Common: response has a links section
+    if isinstance(payload, dict):
+        links = payload.get("links") or payload.get("_links")
+        if isinstance(links, dict) and links.get("next"):
+            nxt = links["next"]
+            return nxt if isinstance(nxt, str) else nxt.get("href")
+
+    # Fallback: bump a page param
+    if pag_type == "page_param" and "page=" in current_url:
+        import re
+        return re.sub(r"page=\d+", f"page={page_num + 1}", current_url)
+
+    return None
+
+
+def scrape(start_url: str, max_pages: int) -> list[dict]:
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+    })
+
+    all_rows: list[dict] = []
+    url = start_url
+    page = 0
+    while url and page < max_pages:
+        page += 1
+        log.info("Fetching page %d: %s", page, url)
+        payload = fetch_json(url, session)
+        rows = extract_rows(payload)
+        log.info("Page %d → %d rows", page, len(rows))
+        all_rows.extend(rows)
+
+        nxt = get_next_page_url(payload, url, page)
+        if not nxt or nxt == url:
+            break
+        url = nxt
+        time.sleep(RATE_LIMIT)
+    return all_rows
+
+
+def write_output(rows: list[dict], path: str, fmt: str) -> None:
+    if not rows:
+        log.warning("No rows to write")
+        return
+    if fmt == "json":
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(rows, f, ensure_ascii=False, indent=2)
+    elif fmt == "jsonl":
+        with open(path, "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    else:
+        fieldnames = list(rows[0].keys())
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            w.writerows(rows)
+    log.info("Wrote %d rows to %s", len(rows), path)
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="Standalone API scraper for {{ target_url }}")
+    p.add_argument("--url", default=API_ENDPOINTS[0])
+    p.add_argument("--output", default="output.{{ strategy.output_format or 'json' }}")
+    p.add_argument("--format", choices=["csv", "json", "jsonl"],
+                   default="{{ strategy.output_format or 'json' }}")
+    p.add_argument("--max-pages", type=int, default=100)
+    args = p.parse_args()
+
+    try:
+        rows = scrape(args.url, args.max_pages)
+        write_output(rows, args.output, args.format)
+        return 0
+    except KeyboardInterrupt:
+        return 130
+    except Exception as e:
+        log.exception("Scrape failed: %s", e)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
